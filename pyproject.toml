@@ -53,6 +53,10 @@ e2b = ["e2b==2.20.0", "e2b-code-interpreter==2.4.1"]
 modal = ["modal==1.3.5"]
 runloop = ["runloop_api_client>=1.16.0,<2.0.0"]
 vercel = ["vercel>=0.5.6,<0.6"]
+aca-sandbox = [
+    "azure-containerapps-sandbox==0.1.0b1; python_version < '3.14'",
+    "azure-identity>=1.15; python_version < '3.14'",
+]
 s3 = ["boto3>=1.34"]
 temporal = [
     "temporalio==1.26.0",
@@ -99,6 +103,7 @@ members = ["agents"]
 
 [tool.uv.sources]
 agents = { workspace = true }
+azure-containerapps-sandbox = { url = "https://files.pythonhosted.org/packages/72/42/c7a6c7d3bdf9147ea995d2f25d8bddd3081fac2cc4ea42837b1989b40de8/azure_containerapps_sandbox-0.1.0b1-py3-none-any.whl" }
 
 [build-system]
 requires = ["hatchling"]
@@ -162,6 +167,10 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["vercel", "vercel.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["azure", "azure.*"]
 ignore_missing_imports = true
 
 [tool.coverage.run]
