@@ -109,6 +109,20 @@ try:
 except Exception:  # pragma: no cover
     _HAS_VERCEL = False
 
+try:
+    from .aca_sandbox import (
+        DEFAULT_ACA_WORKSPACE_ROOT as DEFAULT_ACA_WORKSPACE_ROOT,
+        ACASandboxClient as ACASandboxClient,
+        ACASandboxClientOptions as ACASandboxClientOptions,
+        ACASandboxSession as ACASandboxSession,
+        ACASandboxSessionState as ACASandboxSessionState,
+        ACASandboxVolumeMount as ACASandboxVolumeMount,
+    )
+
+    _HAS_ACA_SANDBOX = True
+except Exception:  # pragma: no cover
+    _HAS_ACA_SANDBOX = False
+
 __all__: list[str] = []
 
 if _HAS_E2B:
@@ -184,6 +198,18 @@ if _HAS_VERCEL:
             "VercelSandboxClientOptions",
             "VercelSandboxSession",
             "VercelSandboxSessionState",
+        ]
+    )
+
+if _HAS_ACA_SANDBOX:
+    __all__.extend(
+        [
+            "DEFAULT_ACA_WORKSPACE_ROOT",
+            "ACASandboxClient",
+            "ACASandboxClientOptions",
+            "ACASandboxSession",
+            "ACASandboxSessionState",
+            "ACASandboxVolumeMount",
         ]
     )
 

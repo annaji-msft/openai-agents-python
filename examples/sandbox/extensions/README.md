@@ -7,7 +7,7 @@ They intentionally keep the flow simple:
 
 1. Build a tiny manifest in memory.
 2. Create a `SandboxAgent` that inspects that workspace through one shell tool.
-3. Run the agent against E2B, Modal, Daytona, Cloudflare, Runloop, Blaxel, or Vercel.
+3. Run the agent against E2B, Modal, Daytona, Cloudflare, Runloop, Blaxel, Vercel, or Azure Container Apps.
 
 All of these examples require `OPENAI_API_KEY`, because they call the model through the normal
 `Runner` path. Each cloud backend also needs its own provider credentials.
@@ -376,3 +376,69 @@ Blaxel sandboxes support cloud bucket mounts (S3, R2, GCS) through
 `BlaxelCloudBucketMountStrategy` and persistent drive mounts through
 `BlaxelDriveMountStrategy`. See the
 [Blaxel Drive docs](https://docs.blaxel.ai/Agent-drive/Overview) for details.
+
+## Azure Container Apps Sandboxes
+
+### Setup
+
+Install the repo extra:
+
+```bash
+uv sync --extra aca-sandbox
+```
+
+The Azure Container Apps Sandboxes backend authenticates through
+[`azure.identity.aio.DefaultAzureCredential`](https://learn.microsoft.com/python/api/azure-identity/azure.identity.aio.defaultazurecredential),
+so the same credential discovery chain works for local development (`az login`)
+and CI (managed identities, service principals).
+
+Export the required environment variables:
+
+```bash
+export OPENAI_API_KEY=...
+export ACA_SUBSCRIPTION_ID=...
+export ACA_RESOURCE_GROUP=...
+export ACA_SANDBOX_GROUP=...
+export ACA_REGION=westus2
+```
+
+Reference docs:
+
+- <https://learn.microsoft.com/azure/container-apps/>
+- <https://pypi.org/project/azure-containerapps-sandbox/>
+
+### Run
+
+```bash
+uv run python examples/sandbox/extensions/aca_runner.py --stream
+```
+
+Useful flags:
+
+- `--disk ubuntu` — public disk image used when no `disk_id` is set.
+- `--model gpt-5.5` — model name to use.
+- `--stream` — stream the response to the terminal.
+
+Existing sandbox-group volumes can be mounted into the sandbox at create time by
+passing `volume_mounts` to `ACASandboxClientOptions`:
+
+```python
+from agents.extensions.sandbox import (
+    ACASandboxClient,
+    ACASandboxClientOptions,
+    ACASandboxVolumeMount,
+)
+
+client = ACASandboxClient(group_client)
+sandbox = await client.create(
+    options=ACASandboxClientOptions(
+        volume_mounts=(
+            ACASandboxVolumeMount(
+                volume_name="shared-memory",
+                mountpoint="/workspace/memories",
+            ),
+        ),
+    ),
+)
+```
+
