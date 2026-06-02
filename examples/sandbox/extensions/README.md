@@ -442,3 +442,51 @@ sandbox = await client.create(
 )
 ```
 
+### Scenario examples
+
+`aca_runner.py` is the minimal smoke test. For richer agent flows, three
+progressive scenarios live under
+[`examples/sandbox/extensions/aca/`](./aca/README.md). They share the same
+`OPENAI_API_KEY` + `ACA_*` environment variables shown above and reuse
+`Shell` + `Filesystem` capabilities from `agents.sandbox.capabilities`.
+
+#### Single sandbox
+
+One sandbox, one agent. Clones a GitHub repository and answers a natural
+language question against it, citing the files it read.
+
+```bash
+uv run python examples/sandbox/extensions/aca/single_sandbox.py \
+    --repo https://github.com/openai/openai-agents-python \
+    "What are the main agent capabilities and how do they fit together?"
+```
+
+#### Parallel sandboxes
+
+Researches several topics in parallel, each in its own sandbox. Topics are
+passed inline with `key|name|source|question`; results land in
+`./.run-output/parallel-<run-id>/` as Markdown plus a `summary.json`.
+
+```bash
+uv run python examples/sandbox/extensions/aca/parallel_sandboxes.py \
+    --topic "fastapi|FastAPI|https://github.com/fastapi/fastapi|What makes FastAPI performant?" \
+    --topic "django|Django|https://github.com/django/django|What are Django's key features?" \
+    --concurrency 2
+```
+
+#### Nested sandboxes (orchestrator-in-sandbox)
+
+The orchestrator agent itself runs inside an Azure Container Apps sandbox.
+It plans the task with a local planner agent, spawns N worker sandboxes in
+parallel against a separate worker group, and synthesizes the findings — all
+from inside its own sandbox. Requires an additional `ACA_WORKER_*` group and
+service-principal credentials; see
+[`aca/README.md`](./aca/README.md#scenario-3--orchestrator-sandbox-that-spawns-worker-sandboxes)
+for full setup.
+
+```bash
+uv run python examples/sandbox/extensions/aca/nested_sandboxes.py \
+    --task "Compare Django and FastAPI for high-throughput APIs." \
+    --workers 3
+```
+
