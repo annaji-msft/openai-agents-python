@@ -7,7 +7,7 @@ They intentionally keep the flow simple:
 
 1. Build a tiny manifest in memory.
 2. Create a `SandboxAgent` that inspects that workspace through one shell tool.
-3. Run the agent against E2B, Modal, Daytona, Cloudflare, Runloop, Blaxel, or Vercel.
+3. Run the agent against E2B, Modal, Daytona, Cloudflare, Runloop, Blaxel, Vercel, or Azure Container Apps.
 
 All of these examples require `OPENAI_API_KEY`, because they call the model through the normal
 `Runner` path. Each cloud backend also needs its own provider credentials.
@@ -376,3 +376,143 @@ Blaxel sandboxes support cloud bucket mounts (S3, R2, GCS) through
 `BlaxelCloudBucketMountStrategy` and persistent drive mounts through
 `BlaxelDriveMountStrategy`. See the
 [Blaxel Drive docs](https://docs.blaxel.ai/Agent-drive/Overview) for details.
+
+## Azure Container Apps Sandboxes
+
+### Setup
+
+Install the repo extra:
+
+```bash
+uv sync --extra aca-sandbox
+```
+
+The Azure Container Apps Sandboxes backend authenticates through
+[`azure.identity.aio.DefaultAzureCredential`](https://learn.microsoft.com/python/api/azure-identity/azure.identity.aio.defaultazurecredential),
+so the same credential discovery chain works for local development (`az login`)
+and CI (managed identities, service principals).
+
+Export the required environment variables:
+
+```bash
+export OPENAI_API_KEY=...
+export ACA_SUBSCRIPTION_ID=...
+export ACA_RESOURCE_GROUP=...
+export ACA_SANDBOX_GROUP=...
+export ACA_REGION=westus2
+```
+
+Reference docs:
+
+- <https://learn.microsoft.com/azure/container-apps/>
+- <https://pypi.org/project/azure-containerapps-sandbox/>
+
+### Run
+
+```bash
+uv run python examples/sandbox/extensions/aca_runner.py --stream
+```
+
+Useful flags:
+
+- `--disk ubuntu` — public disk image used when no `disk_id` is set.
+- `--model gpt-5.5` — model name to use.
+- `--stream` — stream the response to the terminal.
+
+### Azure-native capabilities
+
+ACA sandboxes are useful when you want hosted isolation that is still Azure-native:
+
+| Capability | How ACA exposes it |
+| --- | --- |
+| Azure identity | Uses `DefaultAzureCredential`, so `az login`, managed identity, and service principals all work through the same path. |
+| Public and private disks | Use `disk` for catalog images or `disk_id` for private images. |
+| Snapshot restore | Use `snapshot_id` to restore a backend snapshot; create-only fields are intentionally stripped on restore. |
+| CPU and memory sizing | Pass `cpu` and `memory` through `ACASandboxClientOptions`. |
+| Exposed ports | Pass `exposed_ports`; the provider resolves the backend URL into the SDK's `ExposedPortEndpoint`. |
+| Observability and cleanup | Pass `labels`; the provider also stamps a per-session label. |
+| Native sandbox-group volumes | Add `ACASandboxGroupVolumeMount` entries to the manifest, or pass low-level `volume_mounts` with `ACASandboxVolumeMount`. |
+| Resume | Serialized `ACASandboxSessionState` stores the sandbox id, group, resource group, subscription, and region for later reattach. |
+
+Existing sandbox-group volumes can be mounted into the sandbox at create time by
+adding `ACASandboxGroupVolumeMount` entries to the manifest:
+
+```python
+from agents.extensions.sandbox import (
+    ACASandboxGroupVolumeMount,
+    ACASandboxGroupVolumeMountStrategy,
+    ACASandboxClient,
+    ACASandboxClientOptions,
+)
+from agents.sandbox import Manifest
+
+client = ACASandboxClient(group_client)
+sandbox = await client.create(
+    manifest=Manifest(
+        entries={
+            "memories": ACASandboxGroupVolumeMount(
+                volume_name="shared-memory",
+                mount_strategy=ACASandboxGroupVolumeMountStrategy(),
+                read_only=False,
+            )
+        }
+    ),
+    options=ACASandboxClientOptions(
+        disk="ubuntu",
+    ),
+)
+```
+
+This is ACA's native volume surface, not the generic rclone-style cloud mount
+strategies used by some other hosted providers. Use it when the sandbox group
+already owns the volume and the backend should attach it before execution. For
+advanced callers, `ACASandboxClientOptions.volume_mounts` still exposes the
+lower-level create-time `SandboxVolume` shape directly.
+
+### Scenario examples
+
+`aca_runner.py` is the minimal smoke test. For richer agent flows, three
+progressive scenarios live under
+[`examples/sandbox/extensions/aca/`](./aca/README.md). They share the same
+`OPENAI_API_KEY` + `ACA_*` environment variables shown above and reuse
+`Shell` + `Filesystem` capabilities from `agents.sandbox.capabilities`.
+
+#### Single sandbox
+
+One sandbox, one agent. Clones a GitHub repository and answers a natural
+language question against it, citing the files it read.
+
+```bash
+uv run python examples/sandbox/extensions/aca/single_sandbox.py \
+    --repo https://github.com/openai/openai-agents-python \
+    "What are the main agent capabilities and how do they fit together?"
+```
+
+#### Parallel sandboxes
+
+Researches several topics in parallel, each in its own sandbox. Topics are
+passed inline with `key|name|source|question`; results land in
+`./.run-output/parallel-<run-id>/` as Markdown plus a `summary.json`.
+
+```bash
+uv run python examples/sandbox/extensions/aca/parallel_sandboxes.py \
+    --topic "fastapi|FastAPI|https://github.com/fastapi/fastapi|What makes FastAPI performant?" \
+    --topic "django|Django|https://github.com/django/django|What are Django's key features?" \
+    --concurrency 2
+```
+
+#### Nested sandboxes (orchestrator-in-sandbox)
+
+The orchestrator agent itself runs inside an Azure Container Apps sandbox.
+It plans the task with a local planner agent, spawns N worker sandboxes in
+parallel against a separate worker group, and synthesizes the findings — all
+from inside its own sandbox. Requires an additional `ACA_WORKER_*` group and
+service-principal credentials; see
+[`aca/README.md`](./aca/README.md#scenario-3--orchestrator-sandbox-that-spawns-worker-sandboxes)
+for full setup.
+
+```bash
+uv run python examples/sandbox/extensions/aca/nested_sandboxes.py \
+    --task "Compare Django and FastAPI for high-throughput APIs." \
+    --workers 3
+```
