@@ -71,16 +71,22 @@ uv run python examples/sandbox/extensions/aca/nested_sandboxes.py \
     --workers 3
 ```
 
+By default the launcher installs the SDK inside the orchestrator sandbox from
+your current git `origin` remote and `HEAD` commit, so the in-sandbox supervisor
+uses the same PR version you are testing locally. Override this with
+`--package-spec` or `OPENAI_AGENTS_PACKAGE_SPEC` if you want to test a wheel,
+local package mirror, or a released package instead.
+
 What happens:
 
 1. The launcher (your machine) provisions the orchestrator sandbox using the `ACA_*` group.
-2. It uploads `nested_sandboxes.py` and a JSON config to `/tmp/` in the orchestrator and `pip install`s `openai-agents[aca-sandbox]` there.
+2. It uploads `nested_sandboxes.py`, a JSON config, and a generated `requirements.txt` to `/workspace/orchestrator/` in the orchestrator and `pip install`s that requirement there.
 3. The same file is re-executed inside the orchestrator with `--mode supervisor`. The supervisor builds a fresh `ACASandboxClient` against the worker group, plans the task with a local planner `Agent`, spawns N worker `SandboxAgent`s in parallel (each in its own worker-group sandbox), and synthesizes their findings.
 4. The final answer is streamed back to the launcher's stdout. The orchestrator sandbox is deleted on exit.
 
 ### Security tradeoff
 
-The launcher writes the service-principal secrets into `/tmp/config.json` on the orchestrator sandbox so the supervisor can authenticate. Treat the orchestrator sandbox accordingly: scope the principal narrowly (data-plane on the worker group only), use a short-lived secret if you can, and rely on `delete()` to tear the sandbox down at the end of the run. If you have an alternative such as managed identity available on the orchestrator group, prefer that instead and drop the `env` block from the launcher's config.
+The launcher writes the service-principal secrets into `/workspace/orchestrator/config.json` on the orchestrator sandbox so the supervisor can authenticate. Treat the orchestrator sandbox accordingly: scope the principal narrowly (data-plane on the worker group only), use a short-lived secret if you can, and rely on `delete()` to tear the sandbox down at the end of the run. If you have an alternative such as managed identity available on the orchestrator group, prefer that instead and drop the `env` block from the launcher's config.
 
 ## See also
 

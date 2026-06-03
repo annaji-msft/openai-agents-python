@@ -20,19 +20,26 @@ import shlex
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
+from urllib.parse import urlsplit
 
 from pydantic import ConfigDict, Field
 
 from ....sandbox.errors import (
     ExecTimeoutError,
     ExecTransportError,
+    ExposedPortUnavailableError,
     SandboxError,
     WorkspaceReadNotFoundError,
+    WorkspaceStartError,
 )
 from ....sandbox.manifest import Manifest
 from ....sandbox.session.base_sandbox_session import BaseSandboxSession
 from ....sandbox.session.dependencies import Dependencies
 from ....sandbox.session.manager import Instrumentation
+from ....sandbox.session.runtime_helpers import (
+    RESOLVE_WORKSPACE_PATH_HELPER,
+    RuntimeHelperScript,
+)
 from ....sandbox.session.sandbox_client import BaseSandboxClient, BaseSandboxClientOptions
 from ....sandbox.session.sandbox_session import SandboxSession
 from ....sandbox.session.sandbox_session_state import SandboxSessionState
@@ -328,6 +335,15 @@ class ACASandboxSession(BaseSandboxSession):
     def supports_docker_volume_mounts(self) -> bool:
         return False
 
+    def _runtime_helpers(self) -> tuple[RuntimeHelperScript, ...]:
+        return (RESOLVE_WORKSPACE_PATH_HELPER,)
+
+    def _current_runtime_helper_cache_key(self) -> object | None:
+        return self.state.sandbox_id
+
+    async def _validate_path_access(self, path: Path | str, *, for_write: bool = False) -> Path:
+        return await self._validate_remote_path_access(path, for_write=for_write)
+
     # ---- lifecycle -------------------------------------------------------------------
 
     async def running(self) -> bool:
@@ -365,8 +381,39 @@ class ACASandboxSession(BaseSandboxSession):
             published = await self._sb.add_port(port)
         except Exception as exc:  # noqa: BLE001 - remap to sandbox-native error
             raise _remap_azure_exception(exc, context=f"add_port({port})") from exc
-        host = str(getattr(published, "host", None) or getattr(published, "url", "") or "")
-        return ExposedPortEndpoint(host=host, port=port)
+
+        url = getattr(published, "url", None)
+        if isinstance(url, str) and url:
+            try:
+                split = urlsplit(url)
+                host = split.hostname
+                if host is None:
+                    raise ValueError("missing hostname")
+                port_value = split.port or (443 if split.scheme == "https" else 80)
+                return ExposedPortEndpoint(
+                    host=host,
+                    port=port_value,
+                    tls=split.scheme == "https",
+                    query=split.query,
+                )
+            except Exception as exc:
+                raise ExposedPortUnavailableError(
+                    port=port,
+                    exposed_ports=self.state.exposed_ports,
+                    reason="backend_unavailable",
+                    context={"backend": "aca_sandbox", "detail": "invalid_port_url", "url": url},
+                ) from exc
+
+        host = getattr(published, "host", None)
+        if isinstance(host, str) and host:
+            return ExposedPortEndpoint(host=host, port=port)
+
+        raise ExposedPortUnavailableError(
+            port=port,
+            exposed_ports=self.state.exposed_ports,
+            reason="backend_unavailable",
+            context={"backend": "aca_sandbox", "detail": "missing_port_host"},
+        )
 
     # ---- IO --------------------------------------------------------------------------
 
@@ -381,8 +428,10 @@ class ACASandboxSession(BaseSandboxSession):
                 message="Sandbox client is not bound; call create() first.",
             )
 
-        joined = command[0] if len(command) == 1 else shlex.join(str(part) for part in command)
-        coro = self._sb.exec(str(joined))
+        argv = [str(part) for part in command]
+        env_prefix = await self._build_env_prefix()
+        joined = shlex.join((*env_prefix, *argv))
+        coro = self._sb.exec(str(joined), working_directory=DEFAULT_ACA_WORKSPACE_ROOT)
         try:
             result = await (asyncio.wait_for(coro, timeout=timeout) if timeout else coro)
         except asyncio.TimeoutError as exc:
@@ -398,11 +447,51 @@ class ACASandboxSession(BaseSandboxSession):
                 command=list(command),
             ) from exc
 
+        # Refuse to silently treat a missing exit code as success: capability code
+        # (Filesystem ``tar``, Skills mkdir, etc.) inspects ``exit_code`` to detect
+        # failures, and a dropped code would corrupt the workspace.
+        raw_exit = getattr(result, "exit_code", None)
+        if raw_exit is None:
+            raise ExecTransportError(
+                command=list(command),
+                message=(
+                    "Azure sandbox exec returned no exit_code; cannot determine command success."
+                ),
+            )
         return ExecResult(
             stdout=_ensure_bytes(getattr(result, "stdout", b"")),
             stderr=_ensure_bytes(getattr(result, "stderr", b"")),
-            exit_code=int(getattr(result, "exit_code", 0) or 0),
+            exit_code=int(raw_exit),
         )
+
+    async def _resolved_exec_env(self) -> dict[str, str]:
+        """Return the env vars that should be visible to every exec.
+
+        Manifest entries take precedence over any persisted ``state.env``
+        snapshot so additions made by capabilities (Memory, Skills) after
+        ``create()`` are reflected in subsequent exec calls.
+        """
+
+        manifest = getattr(self.state, "manifest", None)
+        if manifest is None or manifest.environment is None:
+            return {}
+        try:
+            resolved = await manifest.environment.resolve()
+        except Exception:  # noqa: BLE001 - never let env resolution break exec
+            logger.exception("Failed to resolve manifest environment for ACA exec")
+            return {}
+        if not resolved:
+            return {}
+        merged: dict[str, str] = {str(k): str(v) for k, v in resolved.items()}
+        return merged
+
+    async def _build_env_prefix(self) -> tuple[str, ...]:
+        """Build an ``env -- K=V ...`` argv prefix for the resolved env."""
+
+        env = await self._resolved_exec_env()
+        if not env:
+            return ()
+        return ("env", "--", *(f"{key}={value}" for key, value in env.items()))
 
     async def read(self, path: Path, *, user: str | User | None = None) -> io.IOBase:
         if self._sb is None:
@@ -410,7 +499,8 @@ class ACASandboxSession(BaseSandboxSession):
                 command=[],
                 message="Sandbox client is not bound; call create() first.",
             )
-        target = _to_posix(path)
+        workspace_path = await self._validate_path_access(path)
+        target = _to_posix(workspace_path)
         try:
             data = await self._sb.read_file(target)
         except Exception as exc:  # noqa: BLE001 - remap to sandbox-native error
@@ -431,7 +521,8 @@ class ACASandboxSession(BaseSandboxSession):
                 command=[],
                 message="Sandbox client is not bound; call create() first.",
             )
-        target = _to_posix(path)
+        workspace_path = await self._validate_path_access(path, for_write=True)
+        target = _to_posix(workspace_path)
         payload = data.read()
         if isinstance(payload, str):
             payload = payload.encode("utf-8")
@@ -463,6 +554,26 @@ class ACASandboxSession(BaseSandboxSession):
 # ----------------------------------------------------------------------------------
 # Client
 # ----------------------------------------------------------------------------------
+
+
+def _manifest_volume_mounts(manifest: Manifest) -> list[ACASandboxVolumeMount]:
+    from .mounts import ACASandboxGroupVolumeMount, ACASandboxGroupVolumeMountStrategy
+
+    volume_mounts: list[ACASandboxVolumeMount] = []
+    for mount, mount_path in manifest.mount_targets():
+        if not isinstance(mount.mount_strategy, ACASandboxGroupVolumeMountStrategy):
+            continue
+        if not isinstance(mount, ACASandboxGroupVolumeMount):
+            mount.mount_strategy.validate_mount(mount)
+            continue
+        volume_mounts.append(
+            ACASandboxVolumeMount(
+                volume_name=mount.volume_name,
+                mountpoint=ACASandboxGroupVolumeMountStrategy.mountpoint_for(mount, mount_path),
+                read_only=mount.read_only,
+            )
+        )
+    return volume_mounts
 
 
 class ACASandboxClient(BaseSandboxClient[ACASandboxClientOptions]):
@@ -509,6 +620,11 @@ class ACASandboxClient(BaseSandboxClient[ACASandboxClientOptions]):
         labels: dict[str, str] = dict(opts.labels) if opts.labels else {}
         labels.setdefault("session-id", str(session_id))
 
+        # Manifest environment is forwarded to the backend so capability code
+        # (Memory, Skills, agent execs) sees the same env vars Docker/unix-local
+        # already make available inside the sandbox.
+        manifest_env = await resolved_manifest.environment.resolve()
+
         # When restoring from a captured snapshot the backend rejects fields that
         # would contradict the snapshot's pre-recorded state (disk, cpu, memory,
         # ports, volumes, labels). Only the snapshot id and polling controls are
@@ -531,9 +647,12 @@ class ACASandboxClient(BaseSandboxClient[ACASandboxClientOptions]):
                 create_kwargs["cpu"] = opts.cpu
             if opts.memory is not None:
                 create_kwargs["memory"] = opts.memory
+            if manifest_env:
+                create_kwargs["environment"] = dict(manifest_env)
             if opts.exposed_ports:
                 create_kwargs["ports"] = list(opts.exposed_ports)
-            if opts.volume_mounts:
+            volume_mounts = (*opts.volume_mounts, *_manifest_volume_mounts(resolved_manifest))
+            if volume_mounts:
                 from azure.containerapps.sandbox import SandboxVolume
 
                 create_kwargs["volumes"] = [
@@ -542,12 +661,13 @@ class ACASandboxClient(BaseSandboxClient[ACASandboxClientOptions]):
                         mountpoint=mount.mountpoint,
                         read_only=mount.read_only,
                     )
-                    for mount in opts.volume_mounts
+                    for mount in volume_mounts
                 ]
 
         try:
             poller = await self._group_client.begin_create_sandbox(**create_kwargs)
             sandbox_client = await poller.result()
+            await sandbox_client.mkdir(_to_posix(DEFAULT_ACA_WORKSPACE_ROOT))
         except Exception as exc:  # noqa: BLE001 - remap to sandbox-native error
             raise _remap_azure_exception(exc, context="begin_create_sandbox") from exc
 
@@ -611,9 +731,49 @@ class ACASandboxClient(BaseSandboxClient[ACASandboxClientOptions]):
             raise TypeError("ACASandboxClient.resume expects an ACASandboxSessionState")
 
         try:
+            from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
+        except ImportError:  # pragma: no cover - azure-core ships with the extra
+            HttpResponseError = Exception  # type: ignore[assignment, misc]
+            ResourceNotFoundError = Exception  # type: ignore[assignment, misc]
+
+        try:
             sandbox_client = self._group_client.get_sandbox_client(state.sandbox_id)
             # Wake the sandbox if it was auto-suspended; harmless if already running.
             await sandbox_client.ensure_running()
+            await sandbox_client.mkdir(_to_posix(DEFAULT_ACA_WORKSPACE_ROOT))
+        except ResourceNotFoundError as exc:
+            raise WorkspaceStartError(
+                path=Path(DEFAULT_ACA_WORKSPACE_ROOT),
+                context={
+                    "reason": "sandbox_not_found",
+                    "sandbox_id": state.sandbox_id,
+                    "sandbox_group": state.sandbox_group,
+                },
+                cause=exc,
+                message=(
+                    f"Azure sandbox {state.sandbox_id!r} is no longer present in "
+                    f"sandbox group {state.sandbox_group!r}; resume cannot recreate it."
+                ),
+            ) from exc
+        except HttpResponseError as exc:
+            if getattr(exc, "status_code", None) == 404:
+                raise WorkspaceStartError(
+                    path=Path(DEFAULT_ACA_WORKSPACE_ROOT),
+                    context={
+                        "reason": "sandbox_not_found",
+                        "sandbox_id": state.sandbox_id,
+                        "sandbox_group": state.sandbox_group,
+                    },
+                    cause=exc,
+                    message=(
+                        f"Azure sandbox {state.sandbox_id!r} is no longer present "
+                        f"in sandbox group {state.sandbox_group!r}; resume cannot "
+                        "recreate it."
+                    ),
+                ) from exc
+            raise _remap_azure_exception(
+                exc, context=f"resume(sandbox_id={state.sandbox_id!r})"
+            ) from exc
         except Exception as exc:  # noqa: BLE001 - remap to sandbox-native error
             raise _remap_azure_exception(
                 exc, context=f"resume(sandbox_id={state.sandbox_id!r})"
@@ -624,9 +784,12 @@ class ACASandboxClient(BaseSandboxClient[ACASandboxClientOptions]):
             sandbox_client=sandbox_client,
             group_client=self._group_client,
         )
-        # Tell the framework that preserved backend state is intact so it can skip a
-        # full manifest re-apply if the workspace root is still ready.
-        inner._set_start_state_preserved(True)
+        # Only skip the manifest re-apply when the previous session reported the
+        # workspace was fully provisioned. After a snapshot restore the disk is
+        # rebuilt from the recorded state, so workspace_root_ready may be stale
+        # and we let ``start()`` re-apply manifest entries against the new disk.
+        if state.workspace_root_ready:
+            inner._set_start_state_preserved(True)
         return self._wrap_session(inner, instrumentation=self._instrumentation)
 
     def deserialize_session_state(self, payload: dict[str, object]) -> SandboxSessionState:

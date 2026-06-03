@@ -114,6 +114,8 @@ try:
         DEFAULT_ACA_WORKSPACE_ROOT as DEFAULT_ACA_WORKSPACE_ROOT,
         ACASandboxClient as ACASandboxClient,
         ACASandboxClientOptions as ACASandboxClientOptions,
+        ACASandboxGroupVolumeMount as ACASandboxGroupVolumeMount,
+        ACASandboxGroupVolumeMountStrategy as ACASandboxGroupVolumeMountStrategy,
         ACASandboxSession as ACASandboxSession,
         ACASandboxSessionState as ACASandboxSessionState,
         ACASandboxVolumeMount as ACASandboxVolumeMount,
@@ -204,6 +206,8 @@ if _HAS_VERCEL:
 if _HAS_ACA_SANDBOX:
     __all__.extend(
         [
+            "ACASandboxGroupVolumeMount",
+            "ACASandboxGroupVolumeMountStrategy",
             "DEFAULT_ACA_WORKSPACE_ROOT",
             "ACASandboxClient",
             "ACASandboxClientOptions",

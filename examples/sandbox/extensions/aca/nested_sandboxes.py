@@ -10,7 +10,7 @@ Flow::
     [your machine] launcher mode
          │  provisions orchestrator sandbox
          │  uploads this script + a JSON config
-         │  pip-installs the SDK with the aca-sandbox extra
+         │  pip-installs the configured SDK package spec
          ▼
     [orchestrator sandbox] supervisor mode
          │  builds an ACASandboxClient against the worker group
@@ -30,7 +30,7 @@ Prerequisites:
   orchestrator — can authenticate as itself against the worker group. The
   principal must have data-plane permissions on the worker group.
 - See ``examples/sandbox/extensions/aca/README.md`` for the full setup notes,
-  including the secrets-in-orchestrator-tempfs tradeoff.
+  including the secrets-in-orchestrator-workspace tradeoff.
 
 Run::
 
@@ -45,6 +45,7 @@ import argparse
 import asyncio
 import json
 import os
+import subprocess
 import sys
 import time
 import uuid
@@ -87,14 +88,53 @@ SUPERVISOR_REQUIRED_ENV = (
 
 BOOTSTRAP_SCRIPT = """\
 set -euo pipefail
-cd /tmp
+cd /workspace/orchestrator
 python3 -m pip install --quiet --break-system-packages \\
-    "openai-agents[aca-sandbox]>=0.5.0" 2>&1 | tail -n 5
-exec python3 /tmp/nested.py --mode supervisor /tmp/config.json
+    -r requirements.txt 2>&1 | tail -n 5
+exec python3 nested.py --mode supervisor config.json
 """
 
 
-async def _run_launcher(task: str, workers: int, model: str, disk: str) -> int:
+def _run_git(*args: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def _normalize_git_url(url: str) -> str:
+    if url.startswith("git@github.com:"):
+        return f"https://github.com/{url.removeprefix('git@github.com:')}"
+    return url
+
+
+def _default_package_spec() -> str:
+    override = os.environ.get("OPENAI_AGENTS_PACKAGE_SPEC")
+    if override:
+        return override
+
+    remote = _run_git("remote", "get-url", "origin")
+    commit = _run_git("rev-parse", "HEAD")
+    if remote and commit:
+        return f"openai-agents[aca-sandbox] @ git+{_normalize_git_url(remote)}@{commit}"
+
+    return "openai-agents[aca-sandbox]"
+
+
+async def _run_launcher(
+    task: str,
+    workers: int,
+    model: str,
+    disk: str,
+    package_spec: str,
+) -> int:
     if __package__ is None or __package__ == "":
         sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
     from examples.sandbox.extensions.aca._support import (
@@ -118,6 +158,7 @@ async def _run_launcher(task: str, workers: int, model: str, disk: str) -> int:
     print(f"==> Run id  : {run_id}")
     print(f"==> Task    : {task}")
     print(f"==> Workers : {workers}")
+    print(f"==> Package : {package_spec}")
     print()
     print("[1/4] Provisioning orchestrator sandbox...")
 
@@ -134,16 +175,17 @@ async def _run_launcher(task: str, workers: int, model: str, disk: str) -> int:
         script_bytes = Path(__file__).read_bytes()
         import io as _io  # local alias to avoid leaking import name into module
 
-        await session.write(Path("/tmp/nested.py"), _io.BytesIO(script_bytes))
+        await session.write(Path("orchestrator/nested.py"), _io.BytesIO(script_bytes))
 
         # Worker-group config + secrets handed to the supervisor. These end up
-        # on the orchestrator sandbox tempfs; see README for tradeoffs.
+        # in the orchestrator sandbox workspace; see README for tradeoffs.
         config = {
             "task": task,
             "workers": workers,
             "model": model,
             "disk": disk,
             "run_id": run_id,
+            "package_spec": package_spec,
             "worker_group": {
                 "subscription_id": os.environ["ACA_WORKER_SUBSCRIPTION_ID"],
                 "resource_group": os.environ["ACA_WORKER_RESOURCE_GROUP"],
@@ -161,17 +203,21 @@ async def _run_launcher(task: str, workers: int, model: str, disk: str) -> int:
             },
         }
         await session.write(
-            Path("/tmp/config.json"),
+            Path("orchestrator/config.json"),
             _io.BytesIO(json.dumps(config).encode("utf-8")),
         )
         await session.write(
-            Path("/tmp/bootstrap.sh"),
+            Path("orchestrator/bootstrap.sh"),
             _io.BytesIO(BOOTSTRAP_SCRIPT.encode("utf-8")),
+        )
+        await session.write(
+            Path("orchestrator/requirements.txt"),
+            _io.BytesIO(f"{package_spec}\n".encode()),
         )
 
         print("[3/4] Installing SDK and starting supervisor inside the orchestrator...")
         started = time.perf_counter()
-        result = await session.exec("bash /tmp/bootstrap.sh", timeout=900.0)
+        result = await session.exec("bash /workspace/orchestrator/bootstrap.sh", timeout=900.0)
         elapsed = time.perf_counter() - started
 
         print()
@@ -379,9 +425,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", default="gpt-5.5", help="Model name to use.")
     parser.add_argument("--disk", default="ubuntu", help="Public disk image name.")
     parser.add_argument(
+        "--package-spec",
+        default=_default_package_spec(),
+        help=(
+            "Package spec installed inside the orchestrator sandbox. Defaults to "
+            "OPENAI_AGENTS_PACKAGE_SPEC, then the current git origin+HEAD, then "
+            "'openai-agents[aca-sandbox]'."
+        ),
+    )
+    parser.add_argument(
         "config",
         nargs="?",
-        help="Path to /tmp/config.json (supervisor mode only).",
+        help="Path to config.json (supervisor mode only).",
     )
     args = parser.parse_args(argv)
 
@@ -390,7 +445,9 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--task is required in launcher mode.")
         if args.workers < 1 or args.workers > 8:
             parser.error("--workers must be between 1 and 8.")
-        return asyncio.run(_run_launcher(args.task, args.workers, args.model, args.disk))
+        return asyncio.run(
+            _run_launcher(args.task, args.workers, args.model, args.disk, args.package_spec)
+        )
 
     if not args.config:
         parser.error("supervisor mode requires a config path argument.")

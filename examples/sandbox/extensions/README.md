@@ -419,28 +419,55 @@ Useful flags:
 - `--model gpt-5.5` — model name to use.
 - `--stream` — stream the response to the terminal.
 
+### Azure-native capabilities
+
+ACA sandboxes are useful when you want hosted isolation that is still Azure-native:
+
+| Capability | How ACA exposes it |
+| --- | --- |
+| Azure identity | Uses `DefaultAzureCredential`, so `az login`, managed identity, and service principals all work through the same path. |
+| Public and private disks | Use `disk` for catalog images or `disk_id` for private images. |
+| Snapshot restore | Use `snapshot_id` to restore a backend snapshot; create-only fields are intentionally stripped on restore. |
+| CPU and memory sizing | Pass `cpu` and `memory` through `ACASandboxClientOptions`. |
+| Exposed ports | Pass `exposed_ports`; the provider resolves the backend URL into the SDK's `ExposedPortEndpoint`. |
+| Observability and cleanup | Pass `labels`; the provider also stamps a per-session label. |
+| Native sandbox-group volumes | Add `ACASandboxGroupVolumeMount` entries to the manifest, or pass low-level `volume_mounts` with `ACASandboxVolumeMount`. |
+| Resume | Serialized `ACASandboxSessionState` stores the sandbox id, group, resource group, subscription, and region for later reattach. |
+
 Existing sandbox-group volumes can be mounted into the sandbox at create time by
-passing `volume_mounts` to `ACASandboxClientOptions`:
+adding `ACASandboxGroupVolumeMount` entries to the manifest:
 
 ```python
 from agents.extensions.sandbox import (
+    ACASandboxGroupVolumeMount,
+    ACASandboxGroupVolumeMountStrategy,
     ACASandboxClient,
     ACASandboxClientOptions,
-    ACASandboxVolumeMount,
 )
+from agents.sandbox import Manifest
 
 client = ACASandboxClient(group_client)
 sandbox = await client.create(
-    options=ACASandboxClientOptions(
-        volume_mounts=(
-            ACASandboxVolumeMount(
+    manifest=Manifest(
+        entries={
+            "memories": ACASandboxGroupVolumeMount(
                 volume_name="shared-memory",
-                mountpoint="/workspace/memories",
-            ),
-        ),
+                mount_strategy=ACASandboxGroupVolumeMountStrategy(),
+                read_only=False,
+            )
+        }
+    ),
+    options=ACASandboxClientOptions(
+        disk="ubuntu",
     ),
 )
 ```
+
+This is ACA's native volume surface, not the generic rclone-style cloud mount
+strategies used by some other hosted providers. Use it when the sandbox group
+already owns the volume and the backend should attach it before execution. For
+advanced callers, `ACASandboxClientOptions.volume_mounts` still exposes the
+lower-level create-time `SandboxVolume` shape directly.
 
 ### Scenario examples
 
@@ -489,4 +516,3 @@ uv run python examples/sandbox/extensions/aca/nested_sandboxes.py \
     --task "Compare Django and FastAPI for high-throughput APIs." \
     --workers 3
 ```
-
